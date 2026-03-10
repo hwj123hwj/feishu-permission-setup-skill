@@ -558,19 +558,37 @@ async function createVersion(page, version, changelog, options = {}) {
       throw new Error('未找到审核说明输入框');
     }
 
-    const saved = await clickOne(page, [
-      page.getByRole('button', { name: /保存|Save/i }),
-    ]);
-    if (!saved) {
-      throw new Error('未找到“保存”按钮');
+    if (/\/version\/create/.test(page.url())) {
+      await clickOne(page, [
+        page.getByRole('button', { name: /Create Version|创建版本/i }),
+        page.getByRole('link', { name: /Create Version|创建版本/i }),
+        page.getByText(/Create Version|创建版本/i),
+      ]);
+      await page.waitForTimeout(900);
+      await fillReviewNoteField(page, reviewNote);
     }
 
-    const saveRequest = await page.waitForResponse((res) => {
+    const saveBtn = page.getByRole('button', { name: /保存|Save/i }).first();
+    const saveVisible = (await saveBtn.count().catch(() => 0)) > 0 && await saveBtn.isVisible().catch(() => false);
+    if (!saveVisible) {
+      throw new Error('未找到“保存”按钮');
+    }
+    await saveBtn.scrollIntoViewIfNeeded().catch(() => {});
+    const saveReady = await waitButtonReady(saveBtn, 10000);
+    if (!saveReady) {
+      throw new Error('保存按钮不可点击或处于 loading');
+    }
+    const saveRequestPromise = page.waitForResponse((res) => {
       const method = res.request().method();
       if (!['POST', 'PUT', 'PATCH'].includes(method)) return false;
       const url = res.url();
-      return /app_version|version\/(create|save|submit|publish)|version\/list|version\/change/i.test(url);
-    }, { timeout: 8000 }).catch(() => null);
+      return /developers\/v1\/app_version\/create\/|app_version\/create\//i.test(url);
+    }, { timeout: 10000 }).catch(() => null);
+    await saveBtn.click().catch(async () => {
+      await saveBtn.click({ force: true });
+    });
+
+    const saveRequest = await saveRequestPromise;
 
     await page.waitForTimeout(1200);
     const duplicateVersion = await page.getByText(/版本号.*已存在|Version.*already exists|duplicate/i).first().isVisible().catch(() => false);
@@ -728,6 +746,14 @@ async function publishWithBranch(page, reviewNote) {
     await fallbackAction.click({ force: true });
     const outcome = await waitPublishOutcome();
     if (outcome) return outcome;
+  }
+
+  const viewDetailsBtn = page.getByText(/View Version Details|查看版本详情/i).first();
+  if ((await viewDetailsBtn.count()) > 0 && await viewDetailsBtn.isVisible().catch(() => false)) {
+    await viewDetailsBtn.click({ force: true }).catch(() => {});
+    await page.waitForTimeout(1500);
+    if (await hasReleasedState(page)) return 'released';
+    if (await hasUnderReviewState(page)) return 'submitted_for_review';
   }
 
   const reasonRequired = await page.getByText(/Please fill in the reason for request|请填写.*原因|请补充.*理由/i).first().isVisible().catch(() => false);
@@ -897,12 +923,14 @@ async function run() {
       reviewNote,
     });
     result.versionFlow = versionFlow;
-    result.versionCreated = versionFlow === 'created_new';
+    result.versionCreated = versionFlow === 'created_new' || versionFlow === 'submitted_for_review';
     if (result.addedScopes.length > 0 && versionFlow === 'no_changes_skip_create') {
       throw new Error(`已添加权限但未创建新版本，请检查创建版本页是否真正保存成功。addedScopes=${result.addedScopes.join(',')}`);
     }
     if (versionFlow === 'already_released' || versionFlow === 'no_changes_skip_create') {
       result.status = 'released';
+    } else if (versionFlow === 'submitted_for_review') {
+      result.status = 'submitted_for_review';
     } else {
       result.status = await publishWithBranch(page, reviewNote);
     }
