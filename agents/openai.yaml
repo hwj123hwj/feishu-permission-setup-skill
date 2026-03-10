@@ -1,0 +1,4 @@
+interface:
+  display_name: "Feishu Permission Setup"
+  short_description: "Enable tenant scopes and publish/review"
+  default_prompt: "Use browser automation to enable Feishu tenant token scopes, create a new version, and complete direct publish or online review submission."

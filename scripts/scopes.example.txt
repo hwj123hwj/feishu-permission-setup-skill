@@ -1,0 +1,3 @@
+# one scope per line
+attendance:task:readonly
+attendance:rule:readonly
