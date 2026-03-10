@@ -74,10 +74,27 @@ function escapeRegex(str) {
 async function tryClick(locator) {
   if (await locator.count()) {
     const target = locator.first();
-    if (await target.isVisible()) {
-      await target.click({ force: true });
+    const visible = await target.isVisible().catch(() => false);
+    if (!visible) return false;
+
+    try {
+      await target.scrollIntoViewIfNeeded().catch(() => {});
+      await target.click({ timeout: 3000 });
       return true;
-    }
+    } catch (_) {}
+
+    try {
+      await target.click({ force: true, timeout: 3000 });
+      return true;
+    } catch (_) {}
+
+    try {
+      await target.evaluate((el) => {
+        if (typeof el.click === 'function') el.click();
+        el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, composed: true }));
+      });
+      return true;
+    } catch (_) {}
   }
   return false;
 }
@@ -127,11 +144,12 @@ async function waitForQrReady(page, timeoutMs = 20000) {
   }
 }
 
-async function ensureTenantTab(page) {
-  await clickOne(page, [
-    page.getByRole('tab', { name: /Tenant token scopes/i }),
-    page.getByText(/Tenant token scopes/i),
+async function ensureTenantTab(root) {
+  const ok = await clickOne(root, [
+    root.getByRole('tab', { name: /Tenant token scopes/i }),
+    root.getByText(/Tenant token scopes/i),
   ]);
+  return ok;
 }
 
 async function closeScopeDialogIfOpen(page) {
@@ -193,6 +211,108 @@ async function hasUnderReviewState(page) {
   return false;
 }
 
+function parseApprovalFromRowText(scope, rowText) {
+  if (!rowText) return 'unknown';
+  const compact = String(rowText).replace(/\s+/g, '');
+  const idx = compact.toLowerCase().indexOf(String(scope).toLowerCase());
+  const tail = idx >= 0 ? compact.slice(idx + scope.length, idx + scope.length + 40) : compact;
+  if (/Yes|需要|需审批|NeedApproval/i.test(tail)) return 'yes';
+  if (/No|无需|免审批|NoApproval/i.test(tail)) return 'no';
+  if (/Yes|需要|需审批|NeedApproval/i.test(compact)) return 'yes';
+  if (/No|无需|免审批|NoApproval/i.test(compact)) return 'no';
+  return 'unknown';
+}
+
+async function inspectScopeApproval(page, scope) {
+  const info = {
+    scope,
+    approvalRequired: 'unknown',
+    rowText: '',
+    tab: 'unknown',
+  };
+
+  const opened = await clickOne(page, [
+    page.getByRole('button', { name: /开通权限|Add permission scopes to app/i }),
+  ]);
+  if (!opened) return info;
+
+  const dialog = page.getByRole('dialog').first();
+  const searchInCurrentTab = async () => {
+    await waitAnyVisible([
+      dialog.getByPlaceholder(/例如：获取群组信息|im:chat:readonly|scope|E\.g\./i),
+      dialog.getByRole('textbox').first(),
+    ], 6000);
+
+    let filled = await fillFirstVisible(page, [
+      dialog.getByPlaceholder(/例如：获取群组信息|im:chat:readonly|scope|E\.g\./i),
+      dialog.getByRole('textbox').first(),
+    ], scope);
+    if (!filled) {
+      const fallbackInput = dialog.locator('input.ud__native-input, input[placeholder], input').first();
+      if (await fallbackInput.count()) {
+        await fallbackInput.fill(scope).catch(() => {});
+        filled = true;
+      }
+    }
+    if (!filled) return false;
+
+    for (let i = 0; i < 16; i += 1) {
+      await page.waitForTimeout(300);
+      const found = await dialog.getByText(new RegExp(escapeRegex(scope), 'i')).count();
+      if (found > 0) break;
+    }
+
+    const row = dialog
+      .locator('.virtual-table__row, tr, .ud__table-row')
+      .filter({ hasText: new RegExp(escapeRegex(scope), 'i') })
+      .first();
+    if (!(await row.count())) {
+      const dialogText = ((await dialog.textContent().catch(() => '')) || '').replace(/\s+/g, ' ').trim();
+      if (!new RegExp(escapeRegex(scope), 'i').test(dialogText)) return false;
+      info.rowText = dialogText.slice(0, 800);
+      info.approvalRequired = parseApprovalFromRowText(scope, dialogText);
+      return true;
+    }
+    const rowText = ((await row.textContent().catch(() => '')) || '').replace(/\s+/g, ' ').trim();
+    info.rowText = rowText.slice(0, 400);
+    info.approvalRequired = parseApprovalFromRowText(scope, rowText);
+    return true;
+  };
+
+  await ensureTenantTab(dialog);
+  info.tab = 'tenant';
+  let found = await searchInCurrentTab();
+
+  if (!found) {
+    let switched = false;
+    const userTabByRole = dialog.getByRole('tab', { name: /User token scopes/i });
+    if ((await userTabByRole.count()) > 0) {
+      const last = userTabByRole.last();
+      if (await last.isVisible().catch(() => false)) {
+        await last.click({ force: true }).catch(() => {});
+        switched = true;
+      }
+    }
+    if (!switched) {
+      const userTabByText = dialog.getByText(/User token scopes/i);
+      if ((await userTabByText.count()) > 0) {
+        const last = userTabByText.last();
+        if (await last.isVisible().catch(() => false)) {
+          await last.click({ force: true }).catch(() => {});
+          switched = true;
+        }
+      }
+    }
+    if (switched) {
+      info.tab = 'user';
+      found = await searchInCurrentTab();
+    }
+  }
+
+  await closeScopeDialogIfOpen(page);
+  return info;
+}
+
 async function addScope(page, scope) {
   const mainSearch = page.getByPlaceholder(/E\\.g\\.|例如：获取群组信息|im:chat:readonly/i).first();
   if (await mainSearch.count()) {
@@ -221,7 +341,7 @@ async function addScope(page, scope) {
     throw new Error('未找到“开通权限”按钮');
   }
 
-  await ensureTenantTab(page);
+  await ensureTenantTab(page.getByRole('dialog').first());
 
   const filled = await fillFirstVisible(page, [
     page.getByRole('dialog').getByPlaceholder(/例如：获取群组信息|im:chat:readonly|scope/i),
@@ -375,48 +495,85 @@ async function createVersion(page, version, changelog, options = {}) {
   throw new Error('无法进入版本发布流程：既不能创建版本，也找不到版本详情入口');
 }
 
+async function scrollToBottom(page) {
+  await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight)).catch(() => {});
+  await page.waitForTimeout(300);
+}
+
+async function collectVisibleButtonTexts(page) {
+  return page.locator('button').evaluateAll((buttons) => {
+    const visible = buttons.filter((btn) => {
+      const style = window.getComputedStyle(btn);
+      const hidden = style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0';
+      return !hidden && btn.getClientRects().length > 0;
+    });
+    return visible
+      .map((btn) => (btn.textContent || '').replace(/\s+/g, ' ').trim())
+      .filter(Boolean)
+      .slice(0, 30);
+  }).catch(() => []);
+}
+
 async function publishWithBranch(page, reviewNote) {
   if (await hasReleasedState(page)) {
     return 'released';
   }
 
-  const submitBtn = page.getByRole('button', { name: /Submit for release|提交发布|申请线上发布/i }).first();
-  if ((await submitBtn.count()) > 0 && await submitBtn.isVisible().catch(() => false)) {
-    const ready = await waitButtonReady(submitBtn, 30000);
-    if (!ready) {
-      throw new Error('提交发布按钮长时间处于 loading 或不可点击状态');
-    }
-    await submitBtn.click({ force: true });
+  await fillFirstVisible(page, [
+    page.getByRole('textbox', { name: /帮助审核人员|附加信息|Reason for request/i }),
+    page.locator('textarea[placeholder*="Business scenario"], textarea[placeholder*="审核"], textarea[placeholder*="reason"]').first(),
+  ], reviewNote);
+  await scrollToBottom(page);
 
-    for (let i = 0; i < 40; i += 1) {
-      await new Promise((resolve) => setTimeout(resolve, 500));
+  const submitCandidates = [
+    page.getByRole('button', { name: /Submit for release|提交发布|申请线上发布|申请发布|提交审核|Submit for review|Request release/i }),
+    page.getByText(/Submit for release|提交发布|申请线上发布|申请发布|提交审核|Submit for review|Request release/i),
+  ];
+  for (const locator of submitCandidates) {
+    if ((await locator.count()) > 0 && await locator.first().isVisible().catch(() => false)) {
+      const btn = locator.first();
+      const ready = await waitButtonReady(btn, 30000);
+      if (!ready) {
+        throw new Error('提交发布按钮长时间处于 loading 或不可点击状态');
+      }
+      await btn.click({ force: true });
+
+      for (let i = 0; i < 40; i += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        if (await hasReleasedState(page)) return 'released';
+        if (await hasUnderReviewState(page)) return 'submitted_for_review';
+      }
+
       if (await hasReleasedState(page)) return 'released';
       if (await hasUnderReviewState(page)) return 'submitted_for_review';
+      throw new Error('点击“提交发布”后状态未变化，请人工检查版本详情页状态');
     }
+  }
 
+  const directCandidates = [
+    page.getByRole('button', { name: /确认发布|立即发布|Publish now|Publish/i }),
+    page.getByText(/确认发布|立即发布|Publish now|Publish/i),
+  ];
+  for (const locator of directCandidates) {
+    if ((await locator.count()) && (await locator.first().isVisible().catch(() => false))) {
+      await locator.first().click({ force: true });
+      await page.waitForTimeout(1000);
+      if (await hasReleasedState(page)) return 'released';
+      if (await hasUnderReviewState(page)) return 'submitted_for_review';
+      return 'released';
+    }
+  }
+
+  const fallbackAction = page.locator('button').filter({ hasText: /Submit|Publish|Release|申请|发布|提交|确认/i }).last();
+  if ((await fallbackAction.count()) > 0 && await fallbackAction.isVisible().catch(() => false)) {
+    await fallbackAction.click({ force: true });
+    await page.waitForTimeout(1200);
     if (await hasReleasedState(page)) return 'released';
     if (await hasUnderReviewState(page)) return 'submitted_for_review';
-    throw new Error('点击“提交发布”后状态未变化，请人工检查版本详情页状态');
   }
 
-  const directBtn = page.getByRole('button', { name: /确认发布|Publish/i });
-  const reviewBtn = page.getByRole('button', { name: /申请线上发布/i });
-
-  if ((await directBtn.count()) && (await directBtn.first().isVisible())) {
-    await directBtn.first().click();
-    return 'released';
-  }
-
-  if ((await reviewBtn.count()) && (await reviewBtn.first().isVisible())) {
-    await fillFirstVisible(page, [
-      page.getByRole('textbox', { name: /帮助审核人员|附加信息/i }),
-      page.getByRole('textbox').last(),
-    ], reviewNote);
-    await reviewBtn.first().click();
-    return 'submitted_for_review';
-  }
-
-  throw new Error('未找到发布按钮：既没有“确认发布”也没有“申请线上发布”');
+  const visibleButtons = await collectVisibleButtonTexts(page);
+  throw new Error(`未找到发布按钮：既没有“确认发布”也没有“申请线上发布”。可见按钮=${visibleButtons.join(' | ')}`);
 }
 
 async function run() {
@@ -461,6 +618,7 @@ async function run() {
     pageTitle: '',
     addedScopes: [],
     skippedScopes: [],
+    scopeChecks: [],
     screenshots: [],
     error: null,
   };
@@ -556,6 +714,8 @@ async function run() {
     ]);
 
     for (const scope of scopes) {
+      const check = await inspectScopeApproval(page, scope);
+      result.scopeChecks.push(check);
       const action = await addScope(page, scope);
       await closeScopeDialogIfOpen(page);
       if (action === 'added') result.addedScopes.push(scope);
