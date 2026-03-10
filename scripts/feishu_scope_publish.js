@@ -64,7 +64,7 @@ function parseBool(v) {
 
 function nowVersion() {
   const d = new Date();
-  return `1.${d.getFullYear() % 100}.${String(d.getMonth() + 1).padStart(2, '0')}${String(d.getDate()).padStart(2, '0')}${String(d.getHours()).padStart(2, '0')}${String(d.getMinutes()).padStart(2, '0')}`;
+  return `1.${d.getFullYear() % 100}.${String(d.getMonth() + 1).padStart(2, '0')}${String(d.getDate()).padStart(2, '0')}${String(d.getHours()).padStart(2, '0')}${String(d.getMinutes()).padStart(2, '0')}${String(d.getSeconds()).padStart(2, '0')}`;
 }
 
 function escapeRegex(str) {
@@ -122,16 +122,59 @@ async function clickOne(page, candidates) {
 
 async function fillFirstVisible(page, locators, value) {
   for (const locator of locators) {
-    if ((await locator.count()) > 0) {
-      const input = locator.first();
-      if (await input.isVisible()) {
+    const count = await locator.count().catch(() => 0);
+    if (count <= 0) continue;
+    const limit = Math.min(count, 8);
+    for (let i = 0; i < limit; i += 1) {
+      const input = locator.nth(i);
+      const visible = await input.isVisible().catch(() => false);
+      if (!visible) continue;
+      try {
         await input.click({ force: true });
         await input.fill(value);
         return true;
-      }
+      } catch (_) {}
+      try {
+        await input.evaluate((node, val) => {
+          const isTextarea = node instanceof HTMLTextAreaElement;
+          const proto = isTextarea ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+          const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+          if (setter) setter.call(node, val);
+          else node.value = val;
+          node.dispatchEvent(new Event('input', { bubbles: true }));
+          node.dispatchEvent(new Event('change', { bubbles: true }));
+        }, value);
+        return true;
+      } catch (_) {}
     }
   }
   return false;
+}
+
+async function fillReviewNoteField(page, reviewNote) {
+  const note = String(reviewNote || '').trim();
+  if (!note) return false;
+
+  const directFilled = await fillFirstVisible(page, [
+    page.getByRole('textbox', { name: /帮助审核人员|附加信息|Reason for request/i }),
+    page.getByPlaceholder(/Business scenario|helps the approver|advanced scopes|帮助审核人员|附加信息|审核/i),
+    page.locator('textarea[placeholder*="Business scenario"], textarea[placeholder*="approver"], textarea[placeholder*="advanced scopes"], textarea[placeholder*="审核"], textarea[placeholder*="附加信息"], textarea[placeholder*="approver know more"]').first(),
+  ], note);
+  if (directFilled) return true;
+
+  const textareas = page.locator('textarea');
+  const count = await textareas.count().catch(() => 0);
+  if (count <= 0) return false;
+  const target = count >= 2 ? textareas.nth(1) : textareas.first();
+  const visible = await target.isVisible().catch(() => false);
+  if (!visible) return false;
+
+  await target.click({ force: true }).catch(() => {});
+  await target.fill('').catch(() => {});
+  await target.fill(note).catch(() => {});
+  await target.dispatchEvent('input').catch(() => {});
+  await target.dispatchEvent('change').catch(() => {});
+  return true;
 }
 
 async function waitForQrReady(page, timeoutMs = 20000) {
@@ -220,6 +263,14 @@ function parseApprovalFromRowText(scope, rowText) {
   if (/No|无需|免审批|NoApproval/i.test(tail)) return 'no';
   if (/Yes|需要|需审批|NeedApproval/i.test(compact)) return 'yes';
   if (/No|无需|免审批|NoApproval/i.test(compact)) return 'no';
+  return 'unknown';
+}
+
+function parseScopeAddedStateFromRowText(rowText) {
+  if (!rowText) return 'unknown';
+  const text = String(rowText).replace(/\s+/g, ' ').trim();
+  if (/Not\s*Added|未添加|未开通|未启用/i.test(text)) return 'not_added';
+  if (/\bAdded\b|已添加|已开通|已启用/i.test(text)) return 'added';
   return 'unknown';
 }
 
@@ -321,14 +372,24 @@ async function addScope(page, scope) {
     await page.waitForTimeout(700);
   }
 
-  const mainAddedRow = page
-    .locator('tr, .virtual-table__row, .ud__table-row')
-    .filter({ hasText: new RegExp(escapeRegex(scope), 'i') })
-    .filter({ hasText: /Added|已添加/i })
-    .first();
   for (let i = 0; i < 16; i += 1) {
-    if (await mainAddedRow.count() && await mainAddedRow.isVisible().catch(() => false)) {
+    const rowText = await page
+      .locator('tr, .virtual-table__row, .ud__table-row')
+      .evaluateAll((rows, needle) => {
+        const key = String(needle || '').toLowerCase();
+        for (const row of rows) {
+          const text = (row.textContent || '').replace(/\s+/g, ' ').trim();
+          if (text.toLowerCase().includes(key)) return text;
+        }
+        return '';
+      }, scope)
+      .catch(() => '');
+    const addedState = parseScopeAddedStateFromRowText(rowText);
+    if (addedState === 'added') {
       return 'already_enabled';
+    }
+    if (addedState === 'not_added') {
+      break;
     }
     await page.waitForTimeout(300);
   }
@@ -407,6 +468,7 @@ async function addScope(page, scope) {
 
 async function createVersion(page, version, changelog, options = {}) {
   const allowCreateNewVersion = options.allowCreateNewVersion !== false;
+  const reviewNote = String(options.reviewNote || '');
   const goRelease = await clickOne(page, [
     page.getByRole('link', { name: /版本管理与发布|Version management/i }),
     page.getByText(/版本管理与发布|Version management/i),
@@ -418,7 +480,12 @@ async function createVersion(page, version, changelog, options = {}) {
 
   await page.waitForTimeout(1200);
   const createBtn = page.getByRole('button', { name: /创建版本|Create Version|Create a version/i }).first();
+  const createLink = page.getByRole('link', { name: /创建版本|Create Version|Create a version/i }).first();
   const viewDetailsBtn = page.getByText(/View Version Details|查看版本详情/i).first();
+  const versionInputCandidates = [
+    page.getByPlaceholder(/对用户展示的正式版本号|上一个版本号为|official app version number|last version number|version number|previous version/i),
+    page.locator('input[placeholder*="版本号"], input[placeholder*="Version number"], input[placeholder*="version number"], input[placeholder*="previous version"], input[placeholder*="last version number"], input[placeholder*="Official app version"]').first(),
+  ];
 
   if (!allowCreateNewVersion) {
     if ((await viewDetailsBtn.count()) > 0 && await viewDetailsBtn.isVisible().catch(() => false)) {
@@ -431,49 +498,120 @@ async function createVersion(page, version, changelog, options = {}) {
     return 'no_changes_skip_create';
   }
 
-  if ((await createBtn.count()) > 0 && await createBtn.isVisible().catch(() => false)) {
-    const createEnabled = await createBtn.isEnabled().catch(() => false);
-    if (createEnabled) {
-      const created = await clickOne(page, [
-        createBtn,
-        page.getByText(/创建版本|Create Version|Create a version/i),
-      ]);
-
-      if (!created) {
-        throw new Error('未找到“创建版本”按钮');
-      }
-
-      const formReady = await waitAnyVisible([
-        page.getByPlaceholder(/对用户展示的正式版本号|Version/i),
-        page.getByRole('textbox', { name: /版本号|Version/i }),
-      ], 8000);
-      if (!formReady) {
-        if (await hasReleasedState(page)) return 'already_released';
-        if (await hasUnderReviewState(page)) return 'submitted_for_review';
-        throw new Error('已点击创建版本，但未出现版本表单');
-      }
-
-      await fillFirstVisible(page, [
-        page.getByPlaceholder(/对用户展示的正式版本号|Version/i),
-        page.getByRole('textbox', { name: /版本号|Version/i }),
-      ], version);
-
-      await fillFirstVisible(page, [
-        page.getByRole('textbox', { name: /更新日志|该内容将展示在应用的更新日志中/i }),
-        page.getByRole('textbox').nth(1),
-      ], changelog);
-
-      const saved = await clickOne(page, [
-        page.getByRole('button', { name: /保存|Save/i }),
-      ]);
-
-      if (!saved) {
-        throw new Error('未找到“保存”按钮');
-      }
-
-      await page.waitForTimeout(1000);
-      return 'created_new';
+  const createCandidates = [
+    createBtn,
+    createLink,
+    page.getByText(/创建版本|Create Version|Create a version/i),
+  ];
+  const clickedCreate = await clickOne(page, createCandidates);
+  if (clickedCreate) {
+    const entryReady = await waitAnyVisible([
+      ...versionInputCandidates,
+      page.getByRole('button', { name: /编辑|Edit/i }),
+      page.getByRole('button', { name: /保存|Save/i }),
+      page.getByRole('button', { name: /返回|Back/i }),
+    ], 20000);
+    if (!entryReady) {
+      if (await hasReleasedState(page)) return 'already_released';
+      if (await hasUnderReviewState(page)) return 'submitted_for_review';
+      throw new Error('已点击创建版本，但未出现版本表单');
     }
+
+    for (let i = 0; i < 20; i += 1) {
+      const loadingVisible = await page.locator('.ud__spin, [class*="loading"]').first().isVisible().catch(() => false);
+      if (!loadingVisible) break;
+      await page.waitForTimeout(500);
+    }
+
+    await clickOne(page, [
+      page.getByRole('button', { name: /编辑|Edit/i }),
+    ]);
+    await page.waitForTimeout(600);
+
+    const editorReady = await waitAnyVisible([
+      ...versionInputCandidates,
+      page.getByPlaceholder(/该内容将展示在应用的更新日志中|This will appear in the app's changelog/i),
+      page.locator('textarea').first(),
+    ], 12000);
+    if (!editorReady) {
+      throw new Error('创建版本页面尚未就绪，未找到可编辑输入框');
+    }
+
+    const versionFilled = await fillFirstVisible(page, versionInputCandidates, version);
+    if (!versionFilled) {
+      throw new Error(`未找到版本号输入框，version=${version}`);
+    }
+
+    const changelogFilled = await fillFirstVisible(page, [
+      page.getByRole('textbox', { name: /更新日志|该内容将展示在应用的更新日志中|changelog/i }),
+      page.getByPlaceholder(/该内容将展示在应用的更新日志中|This will appear in the app's changelog/i),
+      page.locator('textarea[placeholder*="changelog"], textarea[placeholder*="更新日志"]').first(),
+      page.locator('textarea').first(),
+    ], changelog);
+    if (!changelogFilled) {
+      throw new Error('未找到更新日志输入框');
+    }
+
+    const reasonBoxCount = await page.locator('textarea').count().catch(() => 0);
+    const reasonFilled = await fillReviewNoteField(page, reviewNote);
+    if (reasonBoxCount >= 2 && !reasonFilled) {
+      throw new Error('未找到审核说明输入框');
+    }
+
+    const saved = await clickOne(page, [
+      page.getByRole('button', { name: /保存|Save/i }),
+    ]);
+    if (!saved) {
+      throw new Error('未找到“保存”按钮');
+    }
+
+    const saveRequest = await page.waitForResponse((res) => {
+      const method = res.request().method();
+      if (!['POST', 'PUT', 'PATCH'].includes(method)) return false;
+      const url = res.url();
+      return /app_version|version\/(create|save|submit|publish)|version\/list|version\/change/i.test(url);
+    }, { timeout: 8000 }).catch(() => null);
+
+    await page.waitForTimeout(1200);
+    const duplicateVersion = await page.getByText(/版本号.*已存在|Version.*already exists|duplicate/i).first().isVisible().catch(() => false);
+    if (duplicateVersion) {
+      throw new Error(`保存版本失败：版本号已存在，version=${version}`);
+    }
+
+    const reasonRequiredOnCreate = await page.getByText(/Please fill in the reason for request|请填写.*原因|请补充.*理由/i).first().isVisible().catch(() => false);
+    if (reasonRequiredOnCreate) {
+      throw new Error('创建版本被拦截：审核说明未填写或未生效');
+    }
+
+    await waitAnyVisible([
+      page.getByRole('button', { name: /Submit for release|提交发布|申请线上发布|申请发布|提交审核|Submit for review|Request release/i }),
+      page.getByRole('button', { name: /确认发布|立即发布|Publish now|Publish/i }),
+      page.getByText(/Reason for request|帮助审核人员|Scope changes|The changes will take effect/i),
+    ], 5000);
+
+    const backBtnAfterSave = page.getByRole('button', { name: /返回|Back/i }).first();
+    if (/\/version\/create/.test(page.url()) && await backBtnAfterSave.isVisible().catch(() => false)) {
+      await backBtnAfterSave.click({ force: true }).catch(() => {});
+      await page.waitForTimeout(1200);
+    }
+
+    let versionSeen = false;
+    for (let i = 0; i < 12; i += 1) {
+      const seen = await page.getByText(new RegExp(escapeRegex(version), 'i')).count().catch(() => 0);
+      if (seen > 0) {
+        versionSeen = true;
+        break;
+      }
+      await page.waitForTimeout(300);
+    }
+    if (versionSeen) return 'created_new';
+
+    const createAgainVisible =
+      await page.getByRole('button', { name: /创建版本|Create Version|Create a version/i }).first().isVisible().catch(() => false) ||
+      await page.getByRole('link', { name: /创建版本|Create Version|Create a version/i }).first().isVisible().catch(() => false);
+    if (!saveRequest || createAgainVisible) return 'no_changes_skip_create';
+
+    return 'created_new';
   }
 
   if ((await viewDetailsBtn.count()) > 0 && await viewDetailsBtn.isVisible().catch(() => false)) {
@@ -519,61 +657,86 @@ async function publishWithBranch(page, reviewNote) {
     return 'released';
   }
 
-  await fillFirstVisible(page, [
-    page.getByRole('textbox', { name: /帮助审核人员|附加信息|Reason for request/i }),
-    page.locator('textarea[placeholder*="Business scenario"], textarea[placeholder*="审核"], textarea[placeholder*="reason"]').first(),
-  ], reviewNote);
+  await fillReviewNoteField(page, reviewNote);
+
+  const submitButtonsAtTop = page.getByRole('button', { name: /Submit for release|提交发布|申请线上发布|申请发布|提交审核|Submit for review|Request release/i });
+  const publishButtonsAtTop = page.getByRole('button', { name: /确认发布|立即发布|Publish now|Publish/i });
+  const hasActionButtons =
+    ((await submitButtonsAtTop.count().catch(() => 0)) > 0) ||
+    ((await publishButtonsAtTop.count().catch(() => 0)) > 0);
+  if (!hasActionButtons) {
+    const saveBtn = page.getByRole('button', { name: /保存|Save/i }).first();
+    const backBtn = page.getByRole('button', { name: /返回|Back/i }).first();
+    const editMode = await backBtn.isVisible().catch(() => false);
+    if (editMode) {
+      const saveVisible = await saveBtn.isVisible().catch(() => false);
+      if (saveVisible) {
+        const saveEnabled = await saveBtn.isEnabled().catch(() => false);
+        if (saveEnabled) {
+          await saveBtn.click({ force: true }).catch(() => {});
+          await page.waitForTimeout(800);
+        }
+      }
+
+      const reasonRequired = await page.getByText(/Please fill in the reason for request|请填写.*原因|请补充.*理由/i).first().isVisible().catch(() => false);
+      if (reasonRequired) {
+        throw new Error('发布被拦截：审核说明未填写或未生效，请检查 Reason for request 文本框');
+      }
+
+      await backBtn.click({ force: true }).catch(() => {});
+      await page.waitForTimeout(1200);
+    }
+  }
+
   await scrollToBottom(page);
 
-  const submitCandidates = [
-    page.getByRole('button', { name: /Submit for release|提交发布|申请线上发布|申请发布|提交审核|Submit for review|Request release/i }),
-    page.getByText(/Submit for release|提交发布|申请线上发布|申请发布|提交审核|Submit for review|Request release/i),
-  ];
-  for (const locator of submitCandidates) {
-    if ((await locator.count()) > 0 && await locator.first().isVisible().catch(() => false)) {
-      const btn = locator.first();
+  const waitPublishOutcome = async () => {
+    for (let i = 0; i < 50; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      if (await hasReleasedState(page)) return 'released';
+      if (await hasUnderReviewState(page)) return 'submitted_for_review';
+    }
+    return '';
+  };
+
+  const submitButtons = page.getByRole('button', { name: /Submit for release|提交发布|申请线上发布|申请发布|提交审核|Submit for review|Request release/i });
+  if ((await submitButtons.count()) > 0) {
+    const btn = submitButtons.first();
+    if (await btn.isVisible().catch(() => false)) {
       const ready = await waitButtonReady(btn, 30000);
       if (!ready) {
         throw new Error('提交发布按钮长时间处于 loading 或不可点击状态');
       }
       await btn.click({ force: true });
-
-      for (let i = 0; i < 40; i += 1) {
-        await new Promise((resolve) => setTimeout(resolve, 500));
-        if (await hasReleasedState(page)) return 'released';
-        if (await hasUnderReviewState(page)) return 'submitted_for_review';
-      }
-
-      if (await hasReleasedState(page)) return 'released';
-      if (await hasUnderReviewState(page)) return 'submitted_for_review';
-      throw new Error('点击“提交发布”后状态未变化，请人工检查版本详情页状态');
+      const outcome = await waitPublishOutcome();
+      if (outcome) return outcome;
     }
   }
 
-  const directCandidates = [
-    page.getByRole('button', { name: /确认发布|立即发布|Publish now|Publish/i }),
-    page.getByText(/确认发布|立即发布|Publish now|Publish/i),
-  ];
-  for (const locator of directCandidates) {
-    if ((await locator.count()) && (await locator.first().isVisible().catch(() => false))) {
-      await locator.first().click({ force: true });
-      await page.waitForTimeout(1000);
-      if (await hasReleasedState(page)) return 'released';
-      if (await hasUnderReviewState(page)) return 'submitted_for_review';
-      return 'released';
+  const publishButtons = page.getByRole('button', { name: /确认发布|立即发布|Publish now|Publish/i });
+  if ((await publishButtons.count()) > 0) {
+    const btn = publishButtons.first();
+    if (await btn.isVisible().catch(() => false)) {
+      await btn.click({ force: true });
+      const outcome = await waitPublishOutcome();
+      if (outcome) return outcome;
     }
   }
 
   const fallbackAction = page.locator('button').filter({ hasText: /Submit|Publish|Release|申请|发布|提交|确认/i }).last();
   if ((await fallbackAction.count()) > 0 && await fallbackAction.isVisible().catch(() => false)) {
     await fallbackAction.click({ force: true });
-    await page.waitForTimeout(1200);
-    if (await hasReleasedState(page)) return 'released';
-    if (await hasUnderReviewState(page)) return 'submitted_for_review';
+    const outcome = await waitPublishOutcome();
+    if (outcome) return outcome;
+  }
+
+  const reasonRequired = await page.getByText(/Please fill in the reason for request|请填写.*原因|请补充.*理由/i).first().isVisible().catch(() => false);
+  if (reasonRequired) {
+    throw new Error('发布被拦截：审核说明未填写或未生效，请检查 Reason for request 文本框');
   }
 
   const visibleButtons = await collectVisibleButtonTexts(page);
-  throw new Error(`未找到发布按钮：既没有“确认发布”也没有“申请线上发布”。可见按钮=${visibleButtons.join(' | ')}`);
+  throw new Error(`发布后状态未变化：未进入 Released 或 Under review。可见按钮=${visibleButtons.join(' | ')}`);
 }
 
 async function run() {
@@ -595,7 +758,11 @@ async function run() {
   if (!appId) throw new Error('缺少 appId，请用 --appId 传入');
   if (!scopes.length) throw new Error('缺少 scopes，请用 --scopes 或 --scopesFile 传入');
 
-  const outDir = path.join(process.cwd(), 'artifacts', `feishu-${Date.now()}`);
+  const outDir = path.join(
+    process.cwd(),
+    'artifacts',
+    `feishu-${Date.now()}-${process.pid}-${Math.random().toString(36).slice(2, 6)}`
+  );
   fs.mkdirSync(outDir, { recursive: true });
 
   fs.mkdirSync(userDataDir, { recursive: true });
@@ -619,6 +786,8 @@ async function run() {
     addedScopes: [],
     skippedScopes: [],
     scopeChecks: [],
+    versionFlow: null,
+    versionCreated: false,
     screenshots: [],
     error: null,
   };
@@ -723,7 +892,15 @@ async function run() {
     }
 
     const allowCreate = forceCreateVersion || result.addedScopes.length > 0;
-    const versionFlow = await createVersion(page, version, changelog, { allowCreateNewVersion: allowCreate });
+    const versionFlow = await createVersion(page, version, changelog, {
+      allowCreateNewVersion: allowCreate,
+      reviewNote,
+    });
+    result.versionFlow = versionFlow;
+    result.versionCreated = versionFlow === 'created_new';
+    if (result.addedScopes.length > 0 && versionFlow === 'no_changes_skip_create') {
+      throw new Error(`已添加权限但未创建新版本，请检查创建版本页是否真正保存成功。addedScopes=${result.addedScopes.join(',')}`);
+    }
     if (versionFlow === 'already_released' || versionFlow === 'no_changes_skip_create') {
       result.status = 'released';
     } else {
