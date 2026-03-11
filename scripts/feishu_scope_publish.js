@@ -375,9 +375,7 @@ async function waitPageReady(page, timeoutMs = 3000) {
 }
 
 async function ensureVersionDetailsVisible(page) {
-  await waitPageReady(page, 3000);
-
-  // 判断是否在版本详情页（URL含 /version/数字 但不含 version_management）
+  // 先检查URL（instant），避免不必要的waitPageReady
   const currentUrl = page.url();
   const isOnDetailPage = /\/version\/\d+/.test(currentUrl) && !/version_management/.test(currentUrl);
   console.log(`[PUB] ensureVersionDetailsVisible url=${currentUrl} isOnDetailPage=${isOnDetailPage}`);
@@ -386,6 +384,8 @@ async function ensureVersionDetailsVisible(page) {
     // 已在详情页，直接返回
     return;
   }
+
+  await waitPageReady(page, 2000);
 
   // 不在详情页，需要进入。尝试多种方式。
   console.log('[PUB] not on detail page, trying to navigate...');
@@ -456,23 +456,30 @@ async function clickSubmitForRelease(page) {
     if (visible && enabled) {
       // 先等toast/通知消失，避免遮挡按钮
       await page.locator('.ud__message, .ud__notification, [class*="toast"], [class*="Toast"], [class*="message-notice"]')
-        .first().waitFor({ state: 'hidden', timeout: 5000 }).catch(() => {});
+        .first().waitFor({ state: 'hidden', timeout: 3000 }).catch(() => {});
       await submitBtn.scrollIntoViewIfNeeded().catch(() => {});
+
+      // 同时监听API响应（比DOM变化更快）
+      const publishResponsePromise = page.waitForResponse((res) => {
+        if (!['POST', 'PUT', 'PATCH'].includes(res.request().method())) return false;
+        return /app_version\/(apply|submit|publish|release)|online_publish|submit_audit/i.test(res.url());
+      }, { timeout: 20000 }).catch(() => null);
+
       // 不用 force:true，让 Playwright 等元素真正可点击
-      await submitBtn.click({ timeout: 10000 });
+      await submitBtn.click({ timeout: 5000 });
       console.log('[PUB] submitBtn clicked! waiting for state change...');
 
-      // 等待状态变化：按钮消失/禁用 或 出现"审核中"/"撤回"
+      // 等待任一信号：API响应 / DOM状态变化
       try {
         await Promise.race([
-          // "待申请" 消失
-          page.getByText(/待申请|Not Requested/i).first().waitFor({ state: 'hidden', timeout: 15000 }),
+          // API 响应（通常最快返回）
+          publishResponsePromise.then(() => 'api'),
           // "审核中" 出现
-          page.getByText(/审核中|Under review/i).first().waitFor({ state: 'visible', timeout: 15000 }),
+          page.getByText(/审核中|Under review/i).first().waitFor({ state: 'visible', timeout: 20000 }),
           // "撤回" 按钮出现
-          page.getByRole('button', { name: /Withdraw|撤回/i }).first().waitFor({ state: 'visible', timeout: 15000 }),
-          // "申请线上发布" 按钮变为不可点击/消失
-          submitBtn.waitFor({ state: 'hidden', timeout: 15000 }),
+          page.getByRole('button', { name: /Withdraw|撤回/i }).first().waitFor({ state: 'visible', timeout: 20000 }),
+          // "申请线上发布" 按钮消失
+          submitBtn.waitFor({ state: 'hidden', timeout: 20000 }),
         ]);
         console.log('[PUB] state changed after click');
       } catch (_) {
@@ -717,7 +724,7 @@ async function addScope(page, scope) {
   const dialog = page.getByRole('dialog');
   // 等 scope 文本出现，再确认有可用 checkbox
   await dialog.getByText(new RegExp(escapeRegex(scope), 'i')).first()
-    .waitFor({ state: 'visible', timeout: 10000 }).catch(() => {});
+    .waitFor({ state: 'visible', timeout: 6000 }).catch(() => {});
 
   const hasScopeText = await dialog.getByText(new RegExp(escapeRegex(scope), 'i')).count().catch(() => 0);
   const enabledCheckboxes = await dialog.locator('input[role="checkbox"]:not([disabled])').count().catch(() => 0);
@@ -758,8 +765,8 @@ async function addScope(page, scope) {
   }
   await confirmBtn.click();
   // 等弹窗关闭，再读取状态
-  await dialog.first().waitFor({ state: 'hidden', timeout: 8000 }).catch(() => {});
-  await readMainScopeState(3500);
+  await dialog.first().waitFor({ state: 'hidden', timeout: 5000 }).catch(() => {});
+  await readMainScopeState(2000);
   return 'added';
 }
 
@@ -768,6 +775,7 @@ async function createVersion(page, version, changelog, options = {}) {
   const reviewNote = String(options.reviewNote || '');
   const appId = String(options.appId || '').trim();
   let finalVersion = String(version || '').trim();
+  const cv = (label) => console.log(`[CV] ${label} t=${Date.now()}`);
 
   const enterVersionArea = async () => {
     if (/\/version(\/|$)/.test(page.url())) return true;
@@ -780,10 +788,12 @@ async function createVersion(page, version, changelog, options = {}) {
     return true;
   };
 
+  cv('enter_version_area_start');
   if (!(await enterVersionArea())) {
     throw new Error('未找到“版本管理与发布”入口');
   }
 
+  cv('enter_version_area_done');
   const createBtn = page.getByRole('button', { name: /创建版本|Create Version|Create a version/i }).first();
   const createLink = page.getByRole('link', { name: /创建版本|Create Version|Create a version/i }).first();
   const viewDetailsBtn = page.getByText(/View Version Details|查看版本详情/i).first();
@@ -793,14 +803,17 @@ async function createVersion(page, version, changelog, options = {}) {
     page.locator('input[placeholder*="版本号"], input[placeholder*="Version number"], input[placeholder*="version number"], input[placeholder*="previous version"], input[placeholder*="last version number"], input[placeholder*="Official app version"]').first(),
   ];
 
+  cv('state_check_start');
   if (await hasReleasedState(page)) return 'already_released';
   if (await hasUnderReviewState(page)) return 'submitted_for_review';
+  cv('state_check_done');
 
   const pendingChanges = await hasPendingChangesBanner(page);
   if (!allowCreateNewVersion && !pendingChanges) {
     if ((await viewDetailsBtn.count()) > 0 && await viewDetailsBtn.isVisible().catch(() => false)) {
       await viewDetailsBtn.click({ force: true });
-      await page.waitForTimeout(2500);
+      await page.waitForURL(/\/version\/\d+/, { timeout: 5000 }).catch(() => {});
+      await waitPageReady(page, 2000);
       if (await hasReleasedState(page)) return 'already_released';
       return 'existing_version_detail';
     }
@@ -821,13 +834,14 @@ async function createVersion(page, version, changelog, options = {}) {
   }
 
   if (clickedCreate) {
+    cv('clicked_create');
     const entryReady = await waitAnyVisible([
       ...versionInputCandidates,
       page.getByPlaceholder(/该内容将展示在应用的更新日志中|This will appear in the app's changelog/i),
       saveBtn,
       page.getByRole('button', { name: /编辑|Edit/i }),
       page.getByRole('button', { name: /返回|Back/i }),
-    ], 20000);
+    ], 10000);
     if (!entryReady) {
       if (await hasReleasedState(page)) return 'already_released';
       if (await hasUnderReviewState(page)) return 'submitted_for_review';
@@ -842,13 +856,15 @@ async function createVersion(page, version, changelog, options = {}) {
       ...versionInputCandidates,
       page.getByPlaceholder(/该内容将展示在应用的更新日志中|This will appear in the app's changelog/i),
       page.locator('textarea').first(),
-    ], 12000);
+    ], 8000);
     if (!editorReady) {
       throw new Error('创建版本页面尚未就绪，未找到可编辑输入框');
+    cv('entry_ready_done');
     }
 
     finalVersion = await resolveHigherVersion(page, finalVersion);
     const versionFilled = await fillFirstVisible(page, versionInputCandidates, finalVersion);
+    cv('fill_start');
     if (!versionFilled) {
       throw new Error(`未找到版本号输入框，version=${finalVersion}`);
     }
@@ -874,35 +890,39 @@ async function createVersion(page, version, changelog, options = {}) {
       throw new Error('未找到“保存”按钮');
     }
     await saveBtn.scrollIntoViewIfNeeded().catch(() => {});
-    const saveReady = await waitButtonReady(saveBtn, 12000);
+    cv('fill_done_save_start');
+    const saveReady = await waitButtonReady(saveBtn, 6000);
     if (!saveReady) {
       throw new Error('保存按钮不可点击或处于 loading');
     }
 
     const beforeUrl = page.url();
-    const saveRequestPromise = page.waitForResponse((res) => {
+
+    // 同时启动 response 监听和 click，然后用 Promise.race 等待最先出现的信号
+    const responsePromise = page.waitForResponse((res) => {
       const method = res.request().method();
       if (!['POST', 'PUT', 'PATCH'].includes(method)) return false;
-      const url = res.url();
-      return /app_version\/(create|update|save|submit)|developers\/v1\/app_version\//i.test(url);
-    }, { timeout: 12000 }).catch(() => null);
+      return /app_version\/(create|update|save|submit)|developers\/v1\/app_version\//i.test(res.url());
+    }, { timeout: 15000 }).catch(() => null);
 
     await saveBtn.click().catch(async () => {
       await saveBtn.click({ force: true });
     });
+    cv('save_clicked');
 
-    const saveRequest = await saveRequestPromise;
-    let saveCode = null;
-    if (saveRequest) {
-      saveCode = await saveRequest.json().then((j) => (typeof j?.code === 'number' ? j.code : null)).catch(() => null);
-    }
+    // 等待任一信号：API响应 / URL变化 / 版本详情页元素出现
+    const saveResult = await Promise.race([
+      responsePromise.then(async (res) => {
+        const code = res ? await res.json().then((j) => j?.code).catch(() => null) : null;
+        return { signal: 'api_response', code };
+      }),
+      page.waitForURL(/\/version\/\d+/, { timeout: 15000 }).then(() => ({ signal: 'url_changed' })).catch(() => null),
+      page.getByText(/Not Requested|待申请/i).first().waitFor({ state: 'visible', timeout: 15000 }).then(() => ({ signal: 'not_requested' })).catch(() => null),
+      page.getByRole('button', { name: /Submit for release|申请线上发布/i }).first().waitFor({ state: 'visible', timeout: 15000 }).then(() => ({ signal: 'submit_btn' })).catch(() => null),
+    ]).catch(() => null);
+    cv('save_signal signal=' + JSON.stringify(saveResult));
 
-    // 等待保存后页面有所响应（loading消失或URL跳转），不用固定延迟
-    await Promise.race([
-      page.locator('.ud__spin, [class*="loading"]').first().waitFor({ state: 'hidden', timeout: 6000 }).catch(() => {}),
-      page.waitForURL(/\/version\/\d+/, { timeout: 6000 }).catch(() => {}),
-    ]);
-
+    // 快速检查错误状态
     const duplicateVersion = await page.getByText(/版本号.*已存在|Version.*already exists|duplicate/i).first().isVisible().catch(() => false);
     if (duplicateVersion) {
       throw new Error(`保存版本失败：版本号已存在，version=${finalVersion}`);
@@ -913,12 +933,13 @@ async function createVersion(page, version, changelog, options = {}) {
       throw new Error('创建版本被拦截：审核说明未填写或未生效');
     }
 
-    const postSaveState = await waitVersionPostSaveState(page, 5000);
-    if (postSaveState === 'released') return 'already_released';
-    if (postSaveState === 'created_new') return 'created_new';
-
-    if (saveCode === 0) return 'created_new';
-    if (beforeUrl !== page.url()) return 'created_new';
+    // 判断保存结果
+    if (saveResult) {
+      if (saveResult.signal === 'api_response' && saveResult.code === 0) return 'created_new';
+      if (['url_changed', 'not_requested', 'submit_btn'].includes(saveResult.signal)) return 'created_new';
+    }
+    if (await hasReleasedState(page)) return 'already_released';
+    if (beforeUrl !== page.url() && /\/version\/\d+/.test(page.url())) return 'created_new';
 
     if (/\/version\/create/.test(page.url())) {
       const hints = await page
@@ -936,14 +957,13 @@ async function createVersion(page, version, changelog, options = {}) {
             const saveReady2 = await waitButtonReady(saveBtn, 8000);
             if (saveReady2) {
               await saveBtn.click().catch(async () => { await saveBtn.click({ force: true }); });
-              await Promise.race([
-                page.locator('.ud__spin, [class*="loading"]').first().waitFor({ state: 'hidden', timeout: 6000 }).catch(() => {}),
-                page.waitForURL(/\/version\/\d+/, { timeout: 6000 }).catch(() => {}),
-              ]);
-              const retryState = await waitVersionPostSaveState(page, 15000);
-              if (retryState === 'submitted_for_review') return 'submitted_for_review';
-              if (retryState === 'released') return 'already_released';
-              if (retryState === 'created_new') return 'created_new';
+              const retryResult = await Promise.race([
+                page.waitForURL(/\/version\/\d+/, { timeout: 10000 }).then(() => 'url_changed').catch(() => null),
+                page.getByText(/Not Requested|待申请/i).first().waitFor({ state: 'visible', timeout: 10000 }).then(() => 'created').catch(() => null),
+                page.getByRole('button', { name: /Submit for release|申请线上发布/i }).first().waitFor({ state: 'visible', timeout: 10000 }).then(() => 'created').catch(() => null),
+              ]).catch(() => null);
+              if (retryResult) return 'created_new';
+              if (await hasReleasedState(page)) return 'already_released';
               if (!/\/version\/create/.test(page.url())) return 'created_new';
             }
           }
@@ -964,7 +984,8 @@ async function createVersion(page, version, changelog, options = {}) {
 
   if ((await viewDetailsBtn.count()) > 0 && await viewDetailsBtn.isVisible().catch(() => false)) {
     await viewDetailsBtn.click({ force: true });
-    await page.waitForTimeout(2500);
+    await page.waitForURL(/\/version\/\d+/, { timeout: 5000 }).catch(() => {});
+    await waitPageReady(page, 2000);
     if (await hasReleasedState(page)) {
       return 'already_released';
     }
@@ -983,7 +1004,7 @@ async function createVersion(page, version, changelog, options = {}) {
 
 async function scrollToBottom(page) {
   await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight)).catch(() => {});
-  await page.waitForTimeout(300);
+  await page.waitForTimeout(100);
 }
 
 async function collectVisibleButtonTexts(page) {
@@ -1005,9 +1026,7 @@ async function publishWithBranch(page, reviewNote) {
   const pt = {};
   const pm = (k) => { pt[k] = Date.now(); console.log(`[PUB] ${k} t=${Date.now()}`); };
 
-  // 点击成功即视为提交完成，不等页面状态渲染
   const waitPublishSignal = async () => {
-    await new Promise((r) => setTimeout(r, 500));
     if (await hasReleasedState(page)) return 'released';
     return 'submitted_for_review';
   };
@@ -1022,10 +1041,10 @@ async function publishWithBranch(page, reviewNote) {
   const withdrawBtn = page.getByRole('button', { name: /Withdraw|撤回/i }).first();
   try {
     await Promise.race([
-      submitBtnLocator.waitFor({ state: 'visible', timeout: 8000 }),
-      withdrawBtn.waitFor({ state: 'visible', timeout: 8000 }),
-      page.getByText(/Released at|已发布/i).first().waitFor({ state: 'visible', timeout: 8000 }),
-      page.getByText(/Not Requested|待申请/i).first().waitFor({ state: 'visible', timeout: 8000 }),
+      submitBtnLocator.waitFor({ state: 'visible', timeout: 5000 }),
+      withdrawBtn.waitFor({ state: 'visible', timeout: 5000 }),
+      page.getByText(/Released at|已发布/i).first().waitFor({ state: 'visible', timeout: 5000 }),
+      page.getByText(/Not Requested|待申请/i).first().waitFor({ state: 'visible', timeout: 5000 }),
     ]);
   } catch (_) {
     // 超时也继续
@@ -1243,7 +1262,7 @@ async function run() {
       page.getByRole('link', { name: /权限管理|Permission/i }),
       page.getByRole('button', { name: /权限管理|Permission/i }),
       page.getByText(/权限管理|Permission/i),
-    ], 35000);
+    ], 15000);
     if (!navReady) {
       throw new Error(`页面未就绪：找不到权限管理入口，当前URL=${page.url()}`);
     }
