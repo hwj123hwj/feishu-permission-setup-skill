@@ -179,13 +179,13 @@ async function fillReviewNoteField(page, reviewNote) {
   return true;
 }
 
-async function waitForQrReady(page, timeoutMs = 20000) {
+async function waitForQrReady(page, timeoutMs = 10000) {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
     const loadingVisible = await page.getByText(/Loading|加载中/i).first().isVisible().catch(() => false);
     const qrFrameVisible = await page.locator('canvas, img[alt*=\"QR\"], img[src*=\"qr\"], .qrcode').first().isVisible().catch(() => false);
     if (!loadingVisible && qrFrameVisible) return;
-    await page.waitForTimeout(500);
+    await page.waitForTimeout(300);  // 更快轮询
   }
 }
 
@@ -1048,7 +1048,7 @@ async function run() {
 
     if (loginPage) {
       result.loginRequired = true;
-      await waitForQrReady(page, 25000);
+      await waitForQrReady(page, 10000);
       
       // 尝试只截取二维码区域
       const qrLocator = page.locator('canvas, img[alt*=\"QR\"], img[src*=\"qr\"], .qrcode, [class*=\"qr\"]').first();
