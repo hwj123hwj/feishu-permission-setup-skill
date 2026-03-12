@@ -36,8 +36,8 @@ cd ~/.agents/skills/feishu-permission-setup-skill && \
 ## 执行流程
 
 脚本会自动完成：
-1. 检测登录状态
-2. 如果需要登录 → 截图二维码 → 等待扫码
+1. **预检测登录状态** → 输出 `LOGIN_STATUS=已登录/需要登录`
+2. 如果需要登录 → 截图二维码 → 输出 `SCAN_QR=<路径>`
 3. 开通权限
 4. 创建版本
 5. 发布（自动判断免审核/需审核）
@@ -79,7 +79,12 @@ cd ~/.agents/skills/feishu-permission-setup-skill && \
      node scripts/feishu_scope_publish.js --scopes <scope> --headless true --waitForScanMs 180000
    ```
 
-3. **如果输出 `SCAN_QR=<路径>`**：
+3. **关注输出**：
+   - `LOGIN_STATUS=已登录` → 继续执行，不需要扫码
+   - `LOGIN_STATUS=需要登录` + `SCAN_QR=<路径>` → 发送二维码给用户扫码
+   - `RESULT_JSON=<路径>` → 执行完成，查看结果
+
+4. **如果输出 `SCAN_QR=<路径>`**：
    - 脚本检测到需要登录
    - **立即**用飞书 API 发送截图给用户：
      ```bash
@@ -103,7 +108,7 @@ cd ~/.agents/skills/feishu-permission-setup-skill && \
    - 告诉用户扫码登录
    - 脚本会自动等待扫码完成（最长 180 秒）
 
-4. **向用户报告结果**
+5. **向用户报告结果**
 
 ## 登录态保持
 

@@ -1043,6 +1043,9 @@ async function run() {
       }
     }
 
+    // 输出登录状态
+    console.log(`LOGIN_STATUS=${loginPage ? '需要登录' : '已登录'}`);
+
     if (loginPage) {
       result.loginRequired = true;
       await waitForQrReady(page, 25000);
