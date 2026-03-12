@@ -86,81 +86,31 @@ cd ~/.agents/skills/feishu-permission-setup-skill && \
 
 4. **如果输出 `SCAN_QR=<路径>`**：
    - 脚本检测到需要登录
-   - **立即**用飞书 API 发送截图给用户
+   - **立即**用飞书 API 发送截图给用户：
+     ```bash
+     # 获取 token
+     APP_ID=$(jq -r '.channels.feishu.appId' ~/.openclaw/openclaw.json)
+     APP_SECRET=$(jq -r '.channels.feishu.appSecret' ~/.openclaw/openclaw.json)
+     TOKEN=$(curl -s -X POST "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal" \
+       -H "Content-Type: application/json" \
+       -d "{\"app_id\":\"$APP_ID\",\"app_secret\":\"$APP_SECRET\"}" | jq -r '.tenant_access_token')
+     
+     # 上传图片
+     IMG_KEY=$(curl -s -X POST "https://open.feishu.cn/open-apis/im/v1/images" \
+       -H "Authorization: Bearer $TOKEN" \
+       -F "image_type=message" \
+       -F "image=@<SCAN_QR路径>" | jq -r '.data.image_key')
+     
+     # 发送图片消息
+     curl -s -X POST "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=open_id" \
+       -H "Authorization: Bearer $TOKEN" \
+       -H "Content-Type: application/json" \
+       -d "{\"receive_id\":\"用户open_id\",\"msg_type\":\"image\",\"content\":\"{\\\"image_key\\\":\\\"$IMG_KEY\\\"}\"}"
+     ```
    - 告诉用户扫码登录
    - 脚本会自动等待扫码完成（最长 180 秒）
 
 5. **向用户报告结果**
-
-## 如何发送飞书图片
-
-当脚本输出 `SCAN_QR=<路径>` 时，需要用飞书 API 发送图片给用户。
-
-### 方法一：使用 OpenClaw message 工具（推荐）
-
-如果运行在 OpenClaw 环境中，可以直接使用 `message` 工具：
-
-```
-message action=send media=<SCAN_QR路径> message="请扫码登录飞书开放平台"
-```
-
-### 方法二：直接调用飞书 API
-
-```bash
-# 1. 获取 tenant_access_token
-APP_ID=$(jq -r '.channels.feishu.appId' ~/.openclaw/openclaw.json)
-APP_SECRET=$(jq -r '.channels.feishu.appSecret' ~/.openclaw/openclaw.json)
-
-TOKEN=$(curl -s -X POST "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal" \
-  -H "Content-Type: application/json" \
-  -d "{\"app_id\":\"$APP_ID\",\"app_secret\":\"$APP_SECRET\"}" | jq -r '.tenant_access_token')
-
-# 2. 上传图片
-IMG_KEY=$(curl -s -X POST "https://open.feishu.cn/open-apis/im/v1/images" \
-  -H "Authorization: Bearer $TOKEN" \
-  -F "image_type=message" \
-  -F "image=@<SCAN_QR路径>" | jq -r '.data.image_key')
-
-# 3. 发送图片消息
-curl -s -X POST "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=open_id" \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d "{\"receive_id\":\"用户open_id\",\"msg_type\":\"image\",\"content\":\"{\\\"image_key\\\":\\\"$IMG_KEY\\\"}\"}"
-```
-
-### 方法三：使用 Python
-
-```python
-import requests
-import json
-
-# 获取 token
-resp = requests.post(
-    "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
-    json={"app_id": "YOUR_APP_ID", "app_secret": "YOUR_APP_SECRET"}
-)
-token = resp.json()["tenant_access_token"]
-
-# 上传图片
-with open("<SCAN_QR路径>", "rb") as f:
-    resp = requests.post(
-        "https://open.feishu.cn/open-apis/im/v1/images",
-        headers={"Authorization": f"Bearer {token}"},
-        files={"image_type": (None, "message"), "image": f}
-    )
-image_key = resp.json()["data"]["image_key"]
-
-# 发送图片
-requests.post(
-    "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=open_id",
-    headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-    json={
-        "receive_id": "用户open_id",
-        "msg_type": "image",
-        "content": json.dumps({"image_key": image_key})
-    }
-)
-```
 
 ## 登录态保持
 
