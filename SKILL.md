@@ -84,7 +84,23 @@ cd ~/.agents/skills/feishu-permission-setup-skill && \
    - `LOGIN_STATUS=需要登录` + `SCAN_QR=<路径>` → 发送二维码给用户扫码
    - `RESULT_JSON=<路径>` → 执行完成，查看结果
 
-4. **如果输出 `SCAN_QR=<路径>`**：
+4. **快速发送二维码流程**：
+   ```bash
+   # 运行脚本（后台）
+   cd ~/.agents/skills/feishu-permission-setup-skill && \
+     node scripts/feishu_scope_publish.js --scopes <权限> --headless true --waitForScanMs 180000 > /tmp/feishu-output.txt 2>&1 &
+   
+   # 快速轮询检测 SCAN_QR（每 0.5 秒检测一次）
+   for i in {1..30}; do
+     sleep 0.5
+     SCAN_QR=$(grep "SCAN_QR=" /tmp/feishu-output.txt 2>/dev/null | tail -1 | cut -d= -f2)
+     [ -n "$SCAN_QR" ] && [ -f "$SCAN_QR" ] && break
+   done
+   
+   # 立即发送（见下方命令）
+   ```
+
+5. **如果检测到 `SCAN_QR=<路径>`**：
    - 脚本检测到需要登录
    - **立即**用飞书 API 发送截图给用户：
      ```bash
@@ -110,7 +126,7 @@ cd ~/.agents/skills/feishu-permission-setup-skill && \
    - 告诉用户扫码登录
    - 脚本会自动等待扫码完成（最长 180 秒）
 
-5. **向用户报告结果**
+6. **向用户报告结果**
 
 ## 登录态保持
 
