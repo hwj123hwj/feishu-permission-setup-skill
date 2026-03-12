@@ -122,9 +122,18 @@ cd ~/.agents/skills/feishu-permission-setup-skill && \
 - 过期后脚本会自动检测并输出 `SCAN_QR=<路径>`
 - 按上面的流程发送二维码给用户扫码即可
 
-**如果想要更长时间的登录态**：
-- 定期运行脚本保持 session 活跃
-- 或者手动在浏览器中登录后，复制 cookies 到 profile 目录
+## 截图实现
+
+使用 **Playwright 截图**：
+- 优先截取二维码区域（canvas/img.qrcode 元素）
+- 如果找不到二维码元素，回退到整个页面截图
+- 截图前会等待二维码渲染完成（`waitForQrReady`）
+
+```javascript
+// 截取二维码区域
+const qrLocator = page.locator('canvas, img[alt*="QR"], .qrcode').first();
+await qrLocator.screenshot({ path: 'qr.png' });
+```
 
 ## 常见问题
 

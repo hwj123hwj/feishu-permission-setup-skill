@@ -1049,8 +1049,25 @@ async function run() {
     if (loginPage) {
       result.loginRequired = true;
       await waitForQrReady(page, 25000);
-      const shot = path.join(outDir, 'login-required.png');
-      await page.screenshot({ path: shot, fullPage: true });
+      
+      // 尝试只截取二维码区域
+      const qrLocator = page.locator('canvas, img[alt*=\"QR\"], img[src*=\"qr\"], .qrcode, [class*=\"qr\"]').first();
+      const qrVisible = await qrLocator.isVisible().catch(() => false);
+      
+      let shot;
+      if (qrVisible) {
+        // 截取二维码区域
+        shot = path.join(outDir, 'login-required.png');
+        await qrLocator.screenshot({ path: shot }).catch(async () => {
+          // 如果截取二维码失败，回退到整个页面
+          await page.screenshot({ path: shot, fullPage: true });
+        });
+      } else {
+        // 没找到二维码元素，截取整个页面
+        shot = path.join(outDir, 'login-required.png');
+        await page.screenshot({ path: shot, fullPage: true });
+      }
+      
       result.screenshots.push(shot);
       console.log(`SCAN_QR=${shot}`);
       if (waitForScanMs > 0) {
