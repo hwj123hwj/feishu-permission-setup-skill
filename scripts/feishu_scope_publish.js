@@ -938,7 +938,24 @@ async function publishWithBranch(page, reviewNote) {
 
 async function run() {
   const args = parseArgs(process.argv);
-  const appId = args.appId || process.env.FEISHU_APP_ID;
+  
+  // 自动从 openclaw.json 读取 appId（如果未提供）
+  let appId = args.appId || process.env.FEISHU_APP_ID;
+  if (!appId) {
+    const openclawConfigPath = path.join(process.env.HOME || '/home/q', '.openclaw', 'openclaw.json');
+    try {
+      if (fs.existsSync(openclawConfigPath)) {
+        const config = JSON.parse(fs.readFileSync(openclawConfigPath, 'utf8'));
+        appId = config?.channels?.feishu?.appId;
+        if (appId) {
+          console.log(`AUTO_LOADED_APP_ID=${appId}`);
+        }
+      }
+    } catch (e) {
+      // ignore
+    }
+  }
+  
   const scopesFileArg = args.scopesFile || process.env.FEISHU_SCOPES_FILE;
   const scopesFile = scopesFileArg ? path.resolve(scopesFileArg) : '';
   const scopesFromArg = parseScopesInput(args.scopes || process.env.FEISHU_SCOPES || '');
